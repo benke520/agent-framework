@@ -1729,7 +1729,8 @@ class EmbeddingTelemetryLayer(Generic[EmbeddingInputT, EmbeddingT, EmbeddingOpti
             )
             return result
 
-
+#Upstream caller: Agent -> AgentMiddlewareLayer
+#Dowstream callee: RawAgent(BaseAgent) -> ChatClient
 class AgentTelemetryLayer:
     """Layer that wraps agent run with OpenTelemetry tracing."""
 
@@ -1748,6 +1749,20 @@ class AgentTelemetryLayer:
         self.token_usage_histogram = _get_token_usage_histogram()
         self.duration_histogram = _get_duration_histogram()
 
+    ############################################################################################################################################
+    # Topic: Span lifecycle management — create span, execute closure, capture response/errors, end span
+    # All it does is to translate input request parameters into (static) span attributes, 
+    # and use the agent output/response as (dynamic) span attributes
+    # The core otel structure:
+    # ```
+    # tracer = trace.get_tracer(instrumented_lib_name, instrumented_lib_version)
+    # span = tracer.start_span(span_name)
+    # span.set_attributes(attributes_kwargs)
+    # with trace.use_span(span):
+    #     result = target_function()
+    #     span.set_attributes(result_attributes)
+    # ```
+    ############################################################################################################################################
     def _trace_agent_invocation(
         self,
         *,
@@ -1756,8 +1771,8 @@ class AgentTelemetryLayer:
         merged_options: Mapping[str, Any],
         client_kwargs: Mapping[str, Any] | None,
         stream: bool,
-        execute: Callable[[], Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]],
-    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]:
+        execute: Callable[[], Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]], # The inner wrapped agent call
+    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: # The output from the agent call
         """Trace an agent invocation while delegating execution to ``execute``."""
         global OBSERVABILITY_SETTINGS
         from ._types import ResponseStream
@@ -1765,8 +1780,12 @@ class AgentTelemetryLayer:
         if not OBSERVABILITY_SETTINGS.ENABLED:
             return execute()
 
+        ##########################################################################################################################
+        #Step 1. Get ready the span attributes/properties
+        ##########################################################################################################################
         provider_name = str(self.otel_provider_name)
         merged_client_kwargs = dict(client_kwargs) if client_kwargs is not None else {}
+        #TODO: investigate how the conversation id is set up
         get_otel_conversation_id = cast(
             "Callable[[AgentSession | None], str | None] | None",
             getattr(self, "_get_otel_conversation_id", None),
@@ -1777,16 +1796,26 @@ class AgentTelemetryLayer:
             else (session.service_session_id if (session and isinstance(session.service_session_id, str)) else None)
         )
         attributes = _get_span_attributes(
-            operation_name=OtelAttr.AGENT_INVOKE_OPERATION,
-            provider_name=provider_name,
-            agent_id=getattr(self, "id", "unknown"),
-            agent_name=getattr(self, "name", None) or getattr(self, "id", "unknown"),
-            agent_description=getattr(self, "description", None),
-            thread_id=conversation_id,
+            operation_name=OtelAttr.AGENT_INVOKE_OPERATION, #[what] operation: invoke_agent!!
+            provider_name=provider_name, # [what]'s attributes
+            agent_id=getattr(self, "id", "unknown"), # [who 1]
+            agent_name=getattr(self, "name", None) or getattr(self, "id", "unknown"), # [who 2]
+            agent_description=getattr(self, "description", None), # [who]'s attributes
+            thread_id=conversation_id, # [where]
             all_options=dict(merged_options),
             **merged_client_kwargs,
         )
-
+        ##########################################################################################################################
+        # Step 2. Create span, execute the agent logic, capture response telemetry
+        #
+        # Two paths:
+        #   1. stream=True
+        #   3. stream=False
+        ##########################################################################################################################
+        #=========================================================================================================================
+        #Step 2.2 stream=True path → start a detached span, call execute(), wrap the returned ResponseStream
+        #                           with per-pull context activation + cleanup hooks that finalize & close the span
+        #=========================================================================================================================
         if stream:
             # Do NOT set the inner-telemetry context vars here: this synchronous run() body executes
             # in the CALLER's context, but the ResponseStream may be consumed in a different context
@@ -1919,7 +1948,10 @@ class AgentTelemetryLayer:
             )
             weakref.finalize(wrapped_stream, _close_span)
             return wrapped_stream
-
+        #=========================================================================================================================
+        #Step 2.2 stream=False path → start a span as context manager, await execute() inside it,
+        #                               capture response attributes, span auto-closes on exit
+        #=========================================================================================================================
         async def _run() -> AgentResponse[Any]:
             # Set the inner-telemetry context vars inside the coroutine so the set and the
             # reset in `finally` always happen in the same execution context. `run()` is a sync
@@ -1934,8 +1966,14 @@ class AgentTelemetryLayer:
             )
             inner_accumulated_usage_token = INNER_ACCUMULATED_USAGE.set({})
             try:
+                #-----------------------------------------------------------------------------------------------
+                #1. Create span
+                #-----------------------------------------------------------------------------------------------
                 with _get_span(attributes=attributes, span_name_attribute=OtelAttr.AGENT_NAME) as span:
                     try:
+                        #-----------------------------------------------------------------------------------------------
+                        #2. Add span attributes from request
+                        #-----------------------------------------------------------------------------------------------
                         if OBSERVABILITY_SETTINGS.SENSITIVE_DATA_ENABLED and messages and span.is_recording():
                             _capture_messages(
                                 span=span,
@@ -1944,7 +1982,13 @@ class AgentTelemetryLayer:
                                 system_instructions=_get_instructions_from_options(dict(merged_options)),
                             )
                         start_time_stamp = perf_counter()
+                        #---------------------------------------------------------------------------------------------------
+                        #3. Run closure function
+                        #---------------------------------------------------------------------------------------------------
                         response: AgentResponse[Any] = await execute()
+                        #-----------------------------------------------------------------------------------------------
+                        #4. Add span attributes from response: text, numbers, etc.
+                        #-----------------------------------------------------------------------------------------------
                         duration = perf_counter() - start_time_stamp
                         if response:
                             response_attributes = _get_response_attributes(
@@ -2027,6 +2071,10 @@ class AgentTelemetryLayer:
         client_kwargs: Mapping[str, Any] | None = None,
     ) -> ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: ...
 
+    # Logic path: Agent.run() → AgentMiddlewareLayer.run() → [this] → BaseAgent.run() -> ChatClient.get_response()
+    # Why: Create an `invoke_agent` span that covers all downstream operations (tool calls, LLM chat)
+    # What: Entry point into OTel — creates span, sets attributes, emits via OTel pipeline
+    # How: Wraps super().run() + args into a closure, delegates span lifecycle to `_trace_agent_invocation`
     def run(
         self,
         messages: AgentRunInputs | None = None,
@@ -2196,7 +2244,15 @@ def _activate_span(span: trace.Span) -> Generator[None]:
     finally:
         otel_context.detach(token)
 
-
+#---------------------------------------------------------------------------------------------------------------------------------
+# Pattern: with + @contextmanager + single-yield generator
+#
+# `with ctx-mgr`:       requires ctx manager to have __enter__/__exit__ (the context manager protocol)
+# `@contextmanager`:    works as a bridge in between that auto-generates __enter__/__exit__ from a single-yield generator
+# single-yield gen:     yield splits code into setup (before) and cleanup (after) halves
+#
+# Result: cleanup runs automatically when `with` exits — no manual close needed.
+#---------------------------------------------------------------------------------------------------------------------------------
 @contextlib.contextmanager
 def _get_span(
     attributes: dict[str, Any],
@@ -2210,6 +2266,14 @@ def _get_span(
     span_name = attributes.get(span_name_attribute, "unknown")
     span = get_tracer().start_span(f"{operation} {span_name}")
     span.set_attributes(attributes)
+    #----------------------------------------------------------------------------------------------------------------------------------
+    # use_span: attaches span as current parent in the OTel context (attach/detach)
+    # The next three parameters are an opt-out from OTel's convenience defaults 
+    # so the caller retains full control over what gets recorded and how
+    # end_on_exit=True:              auto-call span.end() when `with` exits
+    # record_exception=False:        don't auto-record exceptions — MAF does it manually via capture_exception()
+    # set_status_on_exception=False: don't auto-set ERROR status — MAF does it manually via capture_exception()
+    #----------------------------------------------------------------------------------------------------------------------------------
     with trace.use_span(
         span=span,
         end_on_exit=True,
